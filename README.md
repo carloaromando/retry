@@ -128,13 +128,11 @@ while(!connect())
 
 ### With Asio
 
-`crn::async_delay_t`, in `<retry/async_retry.hpp>`, is the coroutine version of
-`delay_t`: `co_await backoff()` suspends instead of blocking the thread, and
-returns `false` once the policy is exhausted. The policies and transformers are
-the same ones, and produce the same sequence.
-
-There is no asynchronous `make_retry`: the async half gives you the backoff and
-you write the loop, which keeps the suspension points where you can see them.
+`<retry/async_retry.hpp>` mirrors the blocking half for coroutines.
+`make_async_retry` takes an action returning `asio::awaitable<T>` and gives back
+a description you `co_await`; the result is the same
+`std::expected<T, retry_error>`. Policies, transformers and `with_` combinators
+are the same ones, and produce the same delay sequence.
 
 ```cpp
 #include <retry/async_retry.hpp>
@@ -142,17 +140,15 @@ you write the loop, which keeps the suspension points where you can see them.
 using namespace std::chrono_literals;
 namespace policy = crn::retry::policy;
 
-auto fetch(const std::string& url) -> asio::awaitable<std::optional<page>> {
-    crn::async_delay_t backoff{policy::full_jitter{
-        .transformers = {policy::transformer::limit_attempts{5}},
-        .base = 200ms,
-    }};
+auto fetch(const std::string& url) -> asio::awaitable<crn::retry_result<std::optional<page>>> {
+    auto retrying = crn::make_async_retry(
+        policy::full_jitter{
+            .transformers = {policy::transformer::limit_attempts{5}},
+            .base = 200ms,
+        },
+        [&url]() -> asio::awaitable<std::optional<page>> { co_return co_await http_get(url); });
 
-    while(true) {
-        if(auto result = co_await http_get(url); result) co_return result;
-
-        if(!co_await backoff()) co_return std::nullopt;
-    }
+    co_return co_await retrying();
 }
 ```
 
@@ -162,17 +158,29 @@ Run it the usual way:
 asio::io_context io;
 
 asio::co_spawn(
-    io,
-    [&]() -> asio::awaitable<void> { page = co_await fetch(url); },
-    asio::detached);
+    io, [&]() -> asio::awaitable<void> { result = co_await fetch(url); }, asio::detached);
 
 io.run();
 ```
 
-By default the wait is an `asio::steady_timer` on the coroutine's own executor.
-Pass your own `async_delay_function_t` to the constructor to wait differently —
-the tests pass one that records the duration and returns immediately, which is
-how the suite asserts exact delay sequences without ever sleeping.
+The waiting is an `asio::steady_timer` on the coroutine's own executor. Pass
+your own `async_delay_function_t` to wait differently — the tests pass one that
+records the duration and returns immediately, which is how the suite asserts
+exact delay sequences without ever sleeping.
+
+### Backing off by hand
+
+`crn::async_delay_t` is the coroutine twin of `delay_t`, for loops you want to
+write yourself: `co_await backoff()` suspends instead of blocking, and returns
+`false` once the policy is exhausted.
+
+```cpp
+crn::async_delay_t backoff{policy::exponential{}};
+
+while(!co_await connect())
+    if(!co_await backoff())
+        co_return failure();
+```
 
 ## Requirements
 
