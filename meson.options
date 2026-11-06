@@ -1,0 +1,11 @@
+option('asio'
+       , type : 'feature'
+       , value : 'auto'
+       , description : 'Build the coroutine-based async_retry header and its tests (requires Asio)'
+       )
+
+option('tests'
+       , type : 'boolean'
+       , value : true
+       , description : 'Build the unit tests'
+       )
