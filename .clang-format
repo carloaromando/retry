@@ -1,22 +1,21 @@
 ---
-Language: Cpp
-BasedOnStyle: LLVM
-
-AccessModifierOffset: -4
-AlignAfterOpenBracket: AlwaysBreak
-AllowShortBlocksOnASingleLine: Empty
-AllowShortFunctionsOnASingleLine: Inline
-AllowShortLambdasOnASingleLine: Empty
-BinPackArguments: false
-BinPackParameters: false
-BreakBeforeBraces: Allman
-BreakConstructorInitializers: BeforeColon
-ColumnLimit: 140
+BasedOnStyle: Google
+Standard: Latest
 IndentWidth: 4
-NamespaceIndentation: All
-PackConstructorInitializers: CurrentLine
+AccessModifierOffset: -4
+ColumnLimit: 100
+DerivePointerAlignment: false
 PointerAlignment: Left
 SpaceBeforeParens: Never
-SpaceBeforeRangeBasedForLoopColon: true
-SortIncludes: CaseSensitive
-IncludeBlocks: Preserve
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^<gtest/'
+    Priority: 1
+  - Regex: '^<asio'
+    Priority: 2
+  - Regex: '^<retry/'
+    Priority: 4
+  - Regex: '^<'
+    Priority: 3
+  - Regex: '.*'
+    Priority: 5

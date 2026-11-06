@@ -52,11 +52,10 @@ three independent values.
 Invoking a retry yields `std::expected<T, crn::retry_error>`:
 
 ```cpp
-struct retry_error
-{
-    std::exception_ptr cause;           // the last exception, if the action threw
-    int attempts;                       // how many were made
-    std::chrono::milliseconds waited;   // how long was spent waiting
+struct retry_error {
+    std::exception_ptr cause;          // the last exception, if the action threw
+    int attempts;                      // how many were made
+    std::chrono::milliseconds waited;  // how long was spent waiting
 };
 ```
 
@@ -127,8 +126,53 @@ while(!connect())
         return fail();
 ```
 
-`crn::async_delay_t`, in `<retry/async_retry.hpp>`, is the coroutine version:
-`co_await backoff()` suspends instead of blocking the thread.
+### With Asio
+
+`crn::async_delay_t`, in `<retry/async_retry.hpp>`, is the coroutine version of
+`delay_t`: `co_await backoff()` suspends instead of blocking the thread, and
+returns `false` once the policy is exhausted. The policies and transformers are
+the same ones, and produce the same sequence.
+
+There is no asynchronous `make_retry`: the async half gives you the backoff and
+you write the loop, which keeps the suspension points where you can see them.
+
+```cpp
+#include <retry/async_retry.hpp>
+
+using namespace std::chrono_literals;
+namespace policy = crn::retry::policy;
+
+auto fetch(const std::string& url) -> asio::awaitable<std::optional<page>> {
+    crn::async_delay_t backoff{policy::full_jitter{
+        .transformers = {policy::transformer::limit_attempts{5}},
+        .base = 200ms,
+    }};
+
+    while(true) {
+        if(auto result = co_await http_get(url); result) co_return result;
+
+        if(!co_await backoff()) co_return std::nullopt;
+    }
+}
+```
+
+Run it the usual way:
+
+```cpp
+asio::io_context io;
+
+asio::co_spawn(
+    io,
+    [&]() -> asio::awaitable<void> { page = co_await fetch(url); },
+    asio::detached);
+
+io.run();
+```
+
+By default the wait is an `asio::steady_timer` on the coroutine's own executor.
+Pass your own `async_delay_function_t` to the constructor to wait differently —
+the tests pass one that records the duration and returns immediately, which is
+how the suite asserts exact delay sequences without ever sleeping.
 
 ## Requirements
 

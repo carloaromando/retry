@@ -1,6 +1,7 @@
+#include <gtest/gtest.h>
+
 #include <algorithm>
 #include <chrono>
-#include <gtest/gtest.h>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -13,58 +14,46 @@ using namespace std::chrono_literals;
 
 using ms = crn::retry::duration_t;
 
-namespace
-{
-    constexpr int CASES = 200;
+namespace {
+constexpr int CASES = 200;
 
-    // Fixed seed: a failing property reports the same counterexample on the
-    // next run, which is the only way one is worth debugging.
-    auto generator() -> std::mt19937
-    {
-        return std::mt19937{20240216U};
-    }
+// Fixed seed: a failing property reports the same counterexample on the
+// next run, which is the only way one is worth debugging.
+auto generator() -> std::mt19937 { return std::mt19937{20240216U}; }
 
-    auto any_int(std::mt19937& rng, int low, int high) -> int
-    {
-        return std::uniform_int_distribution<int>{low, high}(rng);
-    }
+auto any_int(std::mt19937& rng, int low, int high) -> int {
+    return std::uniform_int_distribution<int>{low, high}(rng);
+}
 
-    auto any_delay(std::mt19937& rng) -> ms
-    {
-        return ms{any_int(rng, 0, 5000)};
-    }
+auto any_delay(std::mt19937& rng) -> ms { return ms{any_int(rng, 0, 5000)}; }
 
-    auto any_status(std::mt19937& rng) -> detail::status_t
-    {
-        return {
-            .curr_iteration = any_int(rng, 0, 20),
-            .cumulative_delay = any_delay(rng),
-            .previous_delay = any_delay(rng),
-        };
-    }
+auto any_status(std::mt19937& rng) -> detail::status_t {
+    return {
+        .curr_iteration = any_int(rng, 0, 20),
+        .cumulative_delay = any_delay(rng),
+        .previous_delay = any_delay(rng),
+    };
+}
 
-    // One of each limiting transformer, in a random order. None of them reads
-    // the incoming delay, so none of them can rewrite it.
-    auto any_limits(std::mt19937& rng) -> std::vector<policy::transformer_t>
-    {
-        std::vector<policy::transformer_t> transformers{
-            policy::transformer::limit_attempts{any_int(rng, 1, 20)},
-            policy::transformer::limit_by_delay{any_delay(rng)},
-            policy::transformer::limit_by_cumulative_delay{any_delay(rng)},
-        };
+// One of each limiting transformer, in a random order. None of them reads
+// the incoming delay, so none of them can rewrite it.
+auto any_limits(std::mt19937& rng) -> std::vector<policy::transformer_t> {
+    std::vector<policy::transformer_t> transformers{
+        policy::transformer::limit_attempts{any_int(rng, 1, 20)},
+        policy::transformer::limit_by_delay{any_delay(rng)},
+        policy::transformer::limit_by_cumulative_delay{any_delay(rng)},
+    };
 
-        std::shuffle(transformers.begin(), transformers.end(), rng);
+    std::shuffle(transformers.begin(), transformers.end(), rng);
 
-        return transformers;
-    }
-} // namespace
+    return transformers;
+}
+}  // namespace
 
-TEST(property, an_empty_transformer_list_leaves_the_delay_alone)
-{
+TEST(property, an_empty_transformer_list_leaves_the_delay_alone) {
     auto rng = generator();
 
-    for(int i = 0; i < CASES; ++i)
-    {
+    for(int i = 0; i < CASES; ++i) {
         auto status = any_status(rng);
         auto delay = any_delay(rng);
 
@@ -72,15 +61,13 @@ TEST(property, an_empty_transformer_list_leaves_the_delay_alone)
     }
 }
 
-TEST(property, the_order_of_the_transformers_does_not_matter)
-{
+TEST(property, the_order_of_the_transformers_does_not_matter) {
     // Holds because at most one transformer rewrites the delay. Two caps in
     // one list would not commute: each overwrites the other's value, so the
     // last one to fire would win.
     auto rng = generator();
 
-    for(int i = 0; i < CASES; ++i)
-    {
+    for(int i = 0; i < CASES; ++i) {
         auto status = any_status(rng);
         auto delay = any_delay(rng);
 
@@ -89,21 +76,19 @@ TEST(property, the_order_of_the_transformers_does_not_matter)
 
         auto expected = apply_transformers(transformers, status, delay);
 
-        for(int shuffle = 0; shuffle < 5; ++shuffle)
-        {
+        for(int shuffle = 0; shuffle < 5; ++shuffle) {
             std::shuffle(transformers.begin(), transformers.end(), rng);
 
-            EXPECT_EQ(apply_transformers(transformers, status, delay), expected) << "case " << i << ", shuffle " << shuffle;
+            EXPECT_EQ(apply_transformers(transformers, status, delay), expected)
+                << "case " << i << ", shuffle " << shuffle;
         }
     }
 }
 
-TEST(property, limit_attempts_bounds_how_often_the_action_runs)
-{
+TEST(property, limit_attempts_bounds_how_often_the_action_runs) {
     auto rng = generator();
 
-    for(int i = 0; i < CASES; ++i)
-    {
+    for(int i = 0; i < CASES; ++i) {
         auto limit = any_int(rng, -3, 20);
         int calls = 0;
 
@@ -112,8 +97,7 @@ TEST(property, limit_attempts_bounds_how_often_the_action_runs)
                 .transformers = {policy::transformer::limit_attempts{limit}},
                 .delay = 0ms,
             },
-            [&calls]() -> std::optional<int>
-            {
+            [&calls]() -> std::optional<int> {
                 calls++;
                 return std::nullopt;
             },
@@ -130,12 +114,10 @@ TEST(property, limit_attempts_bounds_how_often_the_action_runs)
     }
 }
 
-TEST(property, the_cumulative_delay_accounts_for_every_wait_but_the_last)
-{
+TEST(property, the_cumulative_delay_accounts_for_every_wait_but_the_last) {
     auto rng = generator();
 
-    for(int i = 0; i < CASES; ++i)
-    {
+    for(int i = 0; i < CASES; ++i) {
         policy::exponential policy{
             .transformers = {policy::transformer::limit_attempts{any_int(rng, 2, 12)}},
             .base = ms{any_int(rng, 1, 500)},
@@ -144,14 +126,8 @@ TEST(property, the_cumulative_delay_accounts_for_every_wait_but_the_last)
         std::vector<ms> waited;
         detail::status_t status{};
 
-        while(auto next = crn::retry::delay(
-                  policy,
-                  status,
-                  [&waited](ms delay)
-                  {
-                      waited.push_back(delay);
-                  }))
-        {
+        while(auto next = crn::retry::delay(policy, status,
+                                            [&waited](ms delay) { waited.push_back(delay); })) {
             status = next.value();
 
             auto total = std::accumulate(waited.begin(), waited.end(), ms{0});
@@ -162,19 +138,16 @@ TEST(property, the_cumulative_delay_accounts_for_every_wait_but_the_last)
     }
 }
 
-TEST(property, exponential_backoff_never_shrinks_and_never_overflows)
-{
+TEST(property, exponential_backoff_never_shrinks_and_never_overflows) {
     auto rng = generator();
 
-    for(int i = 0; i < CASES; ++i)
-    {
+    for(int i = 0; i < CASES; ++i) {
         auto base = any_delay(rng);
         auto previous = detail::exponential_backoff(base, 0);
 
         EXPECT_EQ(previous, base);
 
-        for(int iteration = 1; iteration <= 80; ++iteration)
-        {
+        for(int iteration = 1; iteration <= 80; ++iteration) {
             auto current = detail::exponential_backoff(base, iteration);
 
             EXPECT_GE(current, previous) << "base " << base.count() << ", iteration " << iteration;
@@ -185,20 +158,15 @@ TEST(property, exponential_backoff_never_shrinks_and_never_overflows)
     }
 }
 
-TEST(property, a_jittered_delay_stays_within_its_exponential_bound)
-{
+TEST(property, a_jittered_delay_stays_within_its_exponential_bound) {
     auto rng = generator();
 
-    for(int i = 0; i < CASES; ++i)
-    {
+    for(int i = 0; i < CASES; ++i) {
         auto seed = static_cast<std::uint32_t>(any_int(rng, 0, 1000000));
 
         policy::full_jitter policy{
             .base = ms{any_int(rng, 1, 500)},
-            .seeder = [seed]() -> std::seed_seq
-            {
-                return {seed};
-            },
+            .seeder = [seed]() -> std::seed_seq { return {seed}; },
         };
 
         detail::status_t status{.curr_iteration = any_int(rng, 0, 15)};
