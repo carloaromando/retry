@@ -2,10 +2,13 @@
 
 #include <chrono>
 #include <cstddef>
+#include <expected>
 #include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <variant>
 #include <vector>
 
 #include <retry/retry.hpp>
@@ -717,4 +720,259 @@ TEST(exponential_backoff, saturates_instead_of_overflowing) {
     EXPECT_EQ(detail::exponential_backoff(200ms, 3), 1600ms);
     EXPECT_GT(detail::exponential_backoff(200ms, 1000), ms{0});
     EXPECT_EQ(detail::exponential_backoff(200ms, 1000), detail::exponential_backoff(200ms, 2000));
+}
+
+// --- recovering ------------------------------------------------------------
+
+namespace {
+struct transient_t : std::runtime_error {
+    transient_t() : std::runtime_error("try again") {}
+};
+
+struct permanent_t : std::runtime_error {
+    permanent_t() : std::runtime_error("do not try again") {}
+};
+}  // namespace
+
+TEST(recovering, by_default_every_exception_is_worth_another_attempt) {
+    int calls = 0;
+
+    auto result = crn::make_retry(
+        policy::constant{.transformers = {policy::transformer::limit_attempts{3}}, .delay = 0ms},
+        [&calls]() -> opt_string {
+            calls++;
+            throw permanent_t();
+        },
+        {.delay = [](ms) {}})();
+
+    ASSERT_FALSE(result);
+    EXPECT_EQ(calls, 3);
+}
+
+TEST(recovering, recover_only_rethrows_what_it_does_not_recognise) {
+    int calls = 0;
+
+    auto retrying = crn::make_retry(
+        policy::constant{.transformers = {policy::transformer::limit_attempts{5}}, .delay = 0ms},
+        [&calls]() -> opt_string {
+            calls++;
+            throw permanent_t();
+        },
+        {.recover = crn::retry::recover_only<transient_t>(), .delay = [](ms) {}});
+
+    EXPECT_THROW(std::ignore = retrying(), permanent_t);
+    EXPECT_EQ(calls, 1);
+}
+
+TEST(recovering, recover_only_keeps_retrying_what_it_does_recognise) {
+    int calls = 0;
+
+    auto result = crn::make_retry(
+        policy::constant{.transformers = {policy::transformer::limit_attempts{4}}, .delay = 0ms},
+        [&calls]() -> opt_string {
+            calls++;
+            throw transient_t();
+        },
+        {.recover = crn::retry::recover_only<transient_t>(), .delay = [](ms) {}})();
+
+    ASSERT_FALSE(result);
+    EXPECT_EQ(calls, 4);
+    EXPECT_TRUE(result.error().cause);
+}
+
+TEST(recovering, recover_except_is_the_other_way_round) {
+    int calls = 0;
+
+    auto retrying = crn::make_retry(
+        policy::constant{.transformers = {policy::transformer::limit_attempts{5}}, .delay = 0ms},
+        [&calls]() -> opt_string {
+            calls++;
+            throw permanent_t();
+        },
+        {.recover = crn::retry::recover_except<permanent_t>(), .delay = [](ms) {}});
+
+    EXPECT_THROW(std::ignore = retrying(), permanent_t);
+    EXPECT_EQ(calls, 1);
+}
+
+TEST(recovering, a_base_class_counts_as_a_match) {
+    int calls = 0;
+
+    auto result = crn::make_retry(
+        policy::constant{.transformers = {policy::transformer::limit_attempts{3}}, .delay = 0ms},
+        [&calls]() -> opt_string {
+            calls++;
+            throw transient_t();
+        },
+        {.recover = crn::retry::recover_only<std::runtime_error>(), .delay = [](ms) {}})();
+
+    ASSERT_FALSE(result);
+    EXPECT_EQ(calls, 3);
+}
+
+TEST(recovering, recover_none_gives_up_on_the_first_throw) {
+    int calls = 0;
+
+    auto retrying = crn::make_retry(
+        policy::constant{.transformers = {policy::transformer::limit_attempts{5}}, .delay = 0ms},
+        [&calls]() -> opt_string {
+            calls++;
+            throw transient_t();
+        },
+        {.recover = crn::retry::recover_none, .delay = [](ms) {}});
+
+    EXPECT_THROW(std::ignore = retrying(), transient_t);
+    EXPECT_EQ(calls, 1);
+}
+
+// --- transient -------------------------------------------------------------
+
+namespace {
+struct http_error_t {
+    int status;
+};
+
+using response_t = std::expected<std::string, http_error_t>;
+}  // namespace
+
+TEST(transient, by_default_every_failed_result_is_worth_another_attempt) {
+    int calls = 0;
+
+    auto result = crn::make_retry(
+        policy::constant{.transformers = {policy::transformer::limit_attempts{4}}, .delay = 0ms},
+        [&calls]() -> opt_string {
+            calls++;
+            return std::nullopt;
+        },
+        {.delay = [](ms) {}})();
+
+    ASSERT_FALSE(result);
+    EXPECT_EQ(calls, 4);
+}
+
+TEST(transient, a_permanent_failure_stops_the_sequence_at_once) {
+    int calls = 0;
+
+    auto result = crn::make_retry(
+        policy::constant{.transformers = {policy::transformer::limit_attempts{10}}, .delay = 0ms},
+        [&calls]() -> response_t {
+            calls++;
+            return std::unexpected(http_error_t{404});
+        },
+        {.transient =
+             crn::retry::on_error([](const http_error_t& error) { return error.status >= 500; }),
+         .delay = [](ms) {}})();
+
+    EXPECT_EQ(calls, 1);
+
+    // The retry reached an answer, so the outer expected holds a value. The
+    // answer itself is the failure the action reported.
+    ASSERT_TRUE(result);
+    ASSERT_FALSE(result.value());
+    EXPECT_EQ(result.value().error().status, 404);
+}
+
+TEST(transient, a_temporary_failure_is_still_retried) {
+    int calls = 0;
+
+    auto result = crn::make_retry(
+        policy::constant{.transformers = {policy::transformer::limit_attempts{4}}, .delay = 0ms},
+        [&calls]() -> response_t {
+            calls++;
+            return std::unexpected(http_error_t{503});
+        },
+        {.transient =
+             crn::retry::on_error([](const http_error_t& error) { return error.status >= 500; }),
+         .delay = [](ms) {}})();
+
+    EXPECT_EQ(calls, 4);
+
+    // Here the policy ran out, which is the other kind of ending.
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().attempts, 4);
+}
+
+TEST(transient, a_success_is_never_asked_about) {
+    int calls = 0;
+    int asked = 0;
+
+    auto result = crn::make_retry(
+        policy::constant{.transformers = {policy::transformer::limit_attempts{4}}, .delay = 0ms},
+        [&calls]() -> response_t {
+            if(++calls < 3) return std::unexpected(http_error_t{503});
+
+            return "ready";
+        },
+        {.transient =
+             [&asked](const response_t& response) {
+                 asked++;
+                 return response.error().status >= 500;
+             },
+         .delay = [](ms) {}})();
+
+    ASSERT_TRUE(result);
+    ASSERT_TRUE(result.value());
+    EXPECT_EQ(result.value().value(), "ready");
+    EXPECT_EQ(calls, 3);
+    EXPECT_EQ(asked, 2) << "only the two failures were judged";
+}
+
+namespace {
+struct timed_out_t {};
+struct throttled_t {};
+struct not_found_t {};
+
+using fault_t = std::variant<timed_out_t, throttled_t, not_found_t>;
+using fetched_t = std::expected<std::string, fault_t>;
+}  // namespace
+
+TEST(transient, only_these_alternatives_are_worth_retrying) {
+    int calls = 0;
+
+    auto result = crn::make_retry(
+        policy::constant{.transformers = {policy::transformer::limit_attempts{10}}, .delay = 0ms},
+        [&calls]() -> fetched_t {
+            calls++;
+            return std::unexpected(not_found_t{});
+        },
+        {.transient = crn::retry::transient_only<timed_out_t, throttled_t>(),
+         .delay = [](ms) {}})();
+
+    EXPECT_EQ(calls, 1);
+    ASSERT_TRUE(result);
+    ASSERT_FALSE(result.value());
+    EXPECT_TRUE(std::holds_alternative<not_found_t>(result.value().error()));
+}
+
+TEST(transient, a_listed_alternative_keeps_being_retried) {
+    int calls = 0;
+
+    auto result = crn::make_retry(
+        policy::constant{.transformers = {policy::transformer::limit_attempts{4}}, .delay = 0ms},
+        [&calls]() -> fetched_t {
+            calls++;
+            return std::unexpected(throttled_t{});
+        },
+        {.transient = crn::retry::transient_only<timed_out_t, throttled_t>(),
+         .delay = [](ms) {}})();
+
+    EXPECT_EQ(calls, 4);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().attempts, 4);
+}
+
+TEST(transient, except_is_the_other_way_round) {
+    int calls = 0;
+
+    auto result = crn::make_retry(
+        policy::constant{.transformers = {policy::transformer::limit_attempts{10}}, .delay = 0ms},
+        [&calls]() -> fetched_t {
+            calls++;
+            return std::unexpected(not_found_t{});
+        },
+        {.transient = crn::retry::transient_except<not_found_t>(), .delay = [](ms) {}})();
+
+    EXPECT_EQ(calls, 1);
+    ASSERT_TRUE(result);
+    EXPECT_FALSE(result.value());
 }

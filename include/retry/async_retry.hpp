@@ -1,7 +1,9 @@
 #pragma once
 
 #include <asio/awaitable.hpp>
+#include <asio/error.hpp>
 #include <asio/steady_timer.hpp>
+#include <asio/system_error.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 
@@ -59,11 +61,35 @@ inline auto async_delay(retry::policy_t policy, retry::detail::status_t prev,
     co_return next;
 }
 
+namespace detail {
+inline auto is_cancellation(const std::exception_ptr& cause) -> bool {
+    if(!cause) return false;
+
+    try {
+        std::rethrow_exception(cause);
+    } catch(const asio::system_error& error) {
+        return error.code() == asio::error::operation_aborted;
+    } catch(...) {
+        return false;
+    }
+}
+}  // namespace detail
+
+// Cancellation is not a failure to retry. Swallowing it and trying again is
+// never what the caller asked for, so it is the one thing the asynchronous
+// default refuses to recover from.
+inline const retry::recover_function_t recover_all_but_cancellation =
+    [](const std::exception_ptr& cause) { return !retry::detail::is_cancellation(cause); };
+
 template <typename T>
 struct async_params_t {
     using check_function_t = std::function<bool(const T&)>;
 
+    using transient_function_t = std::function<bool(const T&)>;
+
     check_function_t check{retry::params_t<T>::DEFAULT_CHECK};
+    transient_function_t transient{retry::params_t<T>::DEFAULT_TRANSIENT};
+    retry::recover_function_t recover{retry::recover_all_but_cancellation};
     retry::async_delay_function_t delay{[](retry::duration_t delay) -> asio::awaitable<void> {
         co_await retry::default_async_delay_function(delay);
     }};
@@ -82,9 +108,9 @@ class async_retry_t {
     // Everything the loop needs arrives by value, so the coroutine frame owns
     // its state and cannot outlive a temporary description.
     static auto run_(retry::policy_t policy, retry::async_params_t<T> params, F action)
-        -> asio::awaitable<retry_result<T>> {
+        -> asio::awaitable<retry::result_t<T>> {
         retry::detail::status_t status{};
-        retry_error error{};
+        retry::error_t error{};
 
         while(true) {
             try {
@@ -93,9 +119,17 @@ class async_retry_t {
                 error.attempts += 1;
 
                 if(params.check(result)) co_return result;
+
+                if(!params.transient(result)) co_return result;
+
+                if(!params.transient(result)) co_return result;
             } catch(...) {
+                auto cause = std::current_exception();
+
+                if(!params.recover(cause)) std::rethrow_exception(cause);
+
                 error.attempts += 1;
-                error.cause = std::current_exception();
+                error.cause = cause;
             }
 
             // A loop rather than the recursion its blocking twin uses: each
@@ -120,7 +154,7 @@ public:
                   retry::async_params_t<T> params = retry::async_params_t<T>{})
         : policy_(std::move(policy)), params_(std::move(params)), action_(std::move(action)) {}
 
-    [[nodiscard]] auto operator()() const -> asio::awaitable<retry_result<T>> {
+    [[nodiscard]] auto operator()() const -> asio::awaitable<retry::result_t<T>> {
         return run_(this->policy_, this->params_, this->action_);
     }
 

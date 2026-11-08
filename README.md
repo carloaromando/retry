@@ -49,14 +49,17 @@ three independent values.
 
 ### Results
 
-Invoking a retry yields `std::expected<T, crn::retry_error>`:
+Invoking a retry yields `crn::retry::result_t<T>`, which is
+`std::expected<T, crn::retry::error_t>`:
 
 ```cpp
-struct retry_error {
+namespace crn::retry {
+struct error_t {
     std::exception_ptr cause;          // the last exception, if the action threw
     int attempts;                      // how many were made
     std::chrono::milliseconds waited;  // how long was spent waiting
 };
+}
 ```
 
 Nothing is swallowed: if the action threw, the exception is in `cause`. Being
@@ -72,6 +75,108 @@ By default an attempt succeeds when its result is *explicitly* convertible to
 `bool` and converts to `true` — which covers `std::optional`, smart pointers
 and `std::expected` — while plain values are always accepted: an `int` of `0`
 is a result, not a failure. Pass a `check` for anything else.
+
+### Which failures to retry
+
+A retry that treats every failure alike hides bugs: a 404 does not become a 200
+on the fourth attempt, and a bad argument never will. Two predicates decide,
+one per channel.
+
+**A failed result** — `transient` says whether it is worth another go. The
+default is yes, for everything.
+
+```cpp
+auto fetch = crn::make_retry(policy, get,
+                             {.transient = [](const response_t& r) { return r.status >= 500; }});
+```
+
+When the action returns a `std::expected`, `on_error` reaches into the error
+for you, whatever shape it has:
+
+```cpp
+// a struct, judged by a field
+{.transient = crn::retry::on_error([](const http_error_t& e) { return e.status >= 500; })}
+
+// an enum, judged by value
+{.transient = crn::retry::on_error([](code_t code) { return code == code_t::unavailable; })}
+```
+
+An error shaped as a `std::variant` — what a codebase that avoids exceptions
+usually carries — gets selection by type, the same way the throw channel does:
+
+```cpp
+{.transient = crn::retry::transient_only<timed_out_t, throttled_t>()}
+{.transient = crn::retry::transient_except<not_found_t>()}
+```
+
+**A thrown exception** — `recover` says the same thing for the throw channel.
+Anything it turns down is **rethrown** rather than counted, slept on and tried
+again, the way Haskell's `recovering` rethrows what no handler matches.
+
+```cpp
+{.recover = crn::retry::recover_only<timeout_t, connection_lost_t>()}
+```
+
+| Channel | Predicate | Retries on |
+| --- | --- | --- |
+| result | *(default)* | every failed result |
+| result | `on_error(p)` | errors the predicate accepts |
+| result | `transient_only<Es...>()` | only these variant alternatives |
+| result | `transient_except<Es...>()` | everything but these alternatives |
+| throw | `recover_all` | anything (the default) |
+| throw | `recover_none` | nothing — the first throw ends the sequence |
+| throw | `recover_only<Es...>()` | only these types, base classes included |
+| throw | `recover_except<Es...>()` | everything but these types |
+
+Neither channel is the privileged one. Code that propagates failures as values
+rather than as exceptions has the same selectivity, by type or by predicate,
+without ever touching `recover`.
+
+`recover_all` is the default because it surprises nobody, but it is the wrong
+choice as soon as the action can throw for a reason trying again will not fix.
+Narrow it.
+
+#### Both styles, side by side
+
+The same policy drives an action that returns its errors and one that throws
+them. Only the predicate changes.
+
+```cpp
+namespace retry = crn::retry;
+
+auto backoff = policy::full_jitter{
+    .transformers = {policy::transformer::limit_attempts{5},
+                     policy::transformer::cap_delay{2s}},
+    .base = 200ms,
+};
+
+// std::expected<std::string, std::variant<throttled_t, unavailable_t, forbidden_t>>
+auto page = crn::make_retry(backoff, download,
+                            {.transient = retry::transient_except<forbidden_t>()})();
+
+// std::string, throwing timed_out_t or bad_request_t
+auto sent = crn::make_retry(backoff, upload,
+                            {.recover = retry::recover_only<timed_out_t>()})();
+```
+
+Both retry what is worth retrying and stop at once on what is not: a
+`forbidden_t` comes straight back as a value, a `bad_request_t` is rethrown.
+
+### Two ways to end
+
+The outer `expected` answers one question only: did the retry reach an answer?
+
+- **It has a value** — the retry finished. Usually that is a success; it is
+  also what you get when `transient` called a failure permanent, in which case
+  the value is the failure the action reported. Nothing is lost.
+- **It has an error** — the policy ran out before any answer arrived, and
+  `retry::error_t` says how many attempts were made, how long was spent waiting
+  and what the last exception was.
+
+An action returning `std::expected<V, E>` therefore nests: you get
+`std::expected<std::expected<V, E>, retry::error_t>`. The two layers mean
+different things — the outer is about the retry, the inner about the action —
+and flattening them would throw away the distinction.
 
 ### Policies
 
@@ -131,7 +236,7 @@ while(!connect())
 `<retry/async_retry.hpp>` mirrors the blocking half for coroutines.
 `make_async_retry` takes an action returning `asio::awaitable<T>` and gives back
 a description you `co_await`; the result is the same
-`std::expected<T, retry_error>`. Policies, transformers and `with_` combinators
+`std::expected<T, retry::error_t>`. Policies, transformers and `with_` combinators
 are the same ones, and produce the same delay sequence.
 
 ```cpp
@@ -140,7 +245,7 @@ are the same ones, and produce the same delay sequence.
 using namespace std::chrono_literals;
 namespace policy = crn::retry::policy;
 
-auto fetch(const std::string& url) -> asio::awaitable<crn::retry_result<std::optional<page>>> {
+auto fetch(const std::string& url) -> asio::awaitable<crn::retry::result_t<std::optional<page>>> {
     auto retrying = crn::make_async_retry(
         policy::full_jitter{
             .transformers = {policy::transformer::limit_attempts{5}},
@@ -167,6 +272,16 @@ The waiting is an `asio::steady_timer` on the coroutine's own executor. Pass
 your own `async_delay_function_t` to wait differently — the tests pass one that
 records the duration and returns immediately, which is how the suite asserts
 exact delay sequences without ever sleeping.
+
+#### Cancellation
+
+Asio's own cancellation unwinds the retry by itself: the loop stops where it
+was cancelled rather than treating the abort as a failed attempt. Code that
+turns a cancelled operation into a thrown `system_error` is the case the
+asynchronous default `recover` covers — it recovers from everything **except**
+`operation_aborted`, because swallowing a cancellation and trying again is
+never what the caller asked for. Other Asio errors, a refused connection among
+them, are retried normally.
 
 ### Backing off by hand
 
@@ -246,7 +361,7 @@ records the duration instead of waiting, so the suite runs in milliseconds and
 can assert exact delay sequences.
 
 `.clang-format` is authoritative; run `clang-format -i include/retry/*.hpp
-t/*.cpp` before sending anything. [GUIDE.md](GUIDE.md) has the rest.
+t/*.cpp` before sending anything. [CPP_GUIDELINES.md](CPP_GUIDELINES.md) has the rest.
 
 ## References
 

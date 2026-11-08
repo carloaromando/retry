@@ -136,6 +136,80 @@ using policy_t = std::variant<policy::constant, policy::exponential, policy::ful
                               policy::ringed_exponential_with_jitter>;
 using delay_function_t = std::function<void(duration_t)>;
 
+// Lifts a predicate on the error of a std::expected into one on the result
+// itself, so a retry can ask about the error channel directly.
+template <typename F>
+auto on_error(F predicate) {
+    return [predicate = std::move(predicate)](const auto& result) -> bool {
+        if(result.has_value()) return true;
+
+        return std::invoke(predicate, result.error());
+    };
+}
+
+// Retry only when the error holds one of these alternatives. The value-channel
+// counterpart of recover_only, for errors shaped as a std::variant -- which is
+// what a codebase that avoids exceptions usually carries in its expected.
+template <typename... Es>
+    requires(sizeof...(Es) > 0)
+auto transient_only() {
+    return retry::on_error(
+        [](const auto& error) { return (... || std::holds_alternative<Es>(error)); });
+}
+
+// Retry everything but these alternatives.
+template <typename... Es>
+    requires(sizeof...(Es) > 0)
+auto transient_except() {
+    return retry::on_error(
+        [](const auto& error) { return !(... || std::holds_alternative<Es>(error)); });
+}
+
+// Decides whether a thrown exception is worth another attempt. Anything it
+// turns down is rethrown rather than retried, the way Haskell's `recovering`
+// rethrows what no handler matches.
+using recover_function_t = std::function<bool(const std::exception_ptr&)>;
+
+namespace detail {
+template <typename E>
+auto thrown_as(const std::exception_ptr& cause) -> bool {
+    if(!cause) return false;
+
+    try {
+        std::rethrow_exception(cause);
+    } catch(const E&) {
+        return true;
+    } catch(...) {
+        return false;
+    }
+}
+}  // namespace detail
+
+// Retry on anything. The default, and the wrong choice as soon as the action
+// can throw for a reason trying again will not fix.
+inline const recover_function_t recover_all = [](const std::exception_ptr&) { return true; };
+
+// Never retry a throw: an exception ends the attempt sequence at once.
+inline const recover_function_t recover_none = [](const std::exception_ptr&) { return false; };
+
+// Retry only these exception types, rethrow everything else.
+template <typename... Es>
+    requires(sizeof...(Es) > 0)
+auto recover_only() -> recover_function_t {
+    return [](const std::exception_ptr& cause) {
+        return (... || retry::detail::thrown_as<Es>(cause));
+    };
+}
+
+// Retry everything but these types.
+template <typename... Es>
+    requires(sizeof...(Es) > 0)
+auto recover_except() -> recover_function_t {
+    return [](const std::exception_ptr& cause) {
+        return !(... || retry::detail::thrown_as<Es>(cause));
+    };
+}
+
 template <typename T>
 struct params_t {
     static constexpr auto DEFAULT_CHECK = [](const T& result) -> bool {
@@ -152,8 +226,14 @@ struct params_t {
     };
 
     using check_function_t = std::function<bool(const T&)>;
+    using transient_function_t = std::function<bool(const T&)>;
+
+    // Everything is worth another go until the caller says otherwise.
+    static constexpr auto DEFAULT_TRANSIENT = [](const T&) { return true; };
 
     check_function_t check{DEFAULT_CHECK};
+    transient_function_t transient{DEFAULT_TRANSIENT};
+    recover_function_t recover{retry::recover_all};
     delay_function_t delay{DEFAULT_DELAY};
 };
 
@@ -300,19 +380,19 @@ inline auto delay(const retry::policy_t& policy, const retry::detail::status_t& 
         return next;
     });
 }
-}  // namespace retry
 
 // What is known when a retry gives up. The cause is the exception thrown by
 // the last attempt, if the last attempt threw; it is null when the attempts
 // merely returned results the check rejected.
-struct retry_error {
+struct error_t {
     std::exception_ptr cause{};
     int attempts{0};
-    retry::duration_t waited{0};
+    duration_t waited{0};
 };
 
 template <typename T>
-using retry_result = std::expected<T, retry_error>;
+using result_t = std::expected<T, error_t>;
+}  // namespace retry
 
 // A retry_t is a *description* of a retried computation, not a running one.
 // Building it does nothing; calling it runs it and hands back a value.
@@ -325,16 +405,29 @@ class retry_t {
     retry::params_t<T> params_;
     F action_;
 
-    auto attempt_(retry::detail::status_t status, retry_error error) const -> retry_result<T> {
+    auto attempt_(retry::detail::status_t status, retry::error_t error) const
+        -> retry::result_t<T> {
         try {
             auto result = std::invoke(this->action_);
 
             error.attempts += 1;
 
             if(this->params_.check(result)) return result;
+
+            // A failure the caller calls permanent ends the sequence at once.
+            // The value travels back: the retry did reach an answer, it just
+            // is not a happy one.
+            if(!this->params_.transient(result)) return result;
         } catch(...) {
+            auto cause = std::current_exception();
+
+            // Not every failure is worth another attempt. One the caller does
+            // not recognise travels the ordinary exception path instead of
+            // being counted, slept on and tried again.
+            if(!this->params_.recover(cause)) std::rethrow_exception(cause);
+
             error.attempts += 1;
-            error.cause = std::current_exception();
+            error.cause = cause;
         }
 
         auto next = retry::delay(this->policy_, status, this->params_.delay);
@@ -355,8 +448,8 @@ public:
     retry_t(retry::policy_t policy, F action, retry::params_t<T> params = retry::params_t<T>{})
         : policy_(std::move(policy)), params_(std::move(params)), action_(std::move(action)) {}
 
-    [[nodiscard]] auto operator()() const -> retry_result<T> {
-        return this->attempt_(retry::detail::status_t{}, retry_error{});
+    [[nodiscard]] auto operator()() const -> retry::result_t<T> {
+        return this->attempt_(retry::detail::status_t{}, retry::error_t{});
     }
 
     // The with_ family returns a new description rather than mutating this
