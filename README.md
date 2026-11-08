@@ -71,6 +71,50 @@ auto port = crn::make_retry(read_config)()
                 .value_or(default_port());
 ```
 
+#### Chaining retries
+
+Every retry fails with the same `error_t`, so `and_then` chains them without
+any adapting. Each step carries its own policy and is retried on its own; the
+first one to exhaust its policy short-circuits the rest.
+
+```cpp
+auto quiet = policy::exponential{.transformers = {policy::transformer::limit_attempts{5}},
+                                 .base = 50ms};
+
+auto size = crn::make_retry(quiet, resolve)()
+                .and_then([&](const endpoint_t& endpoint) {
+                    return crn::make_retry(quiet, [&endpoint] { return connect(endpoint); })();
+                })
+                .and_then([&](const session_t& session) {
+                    return crn::make_retry(quiet, [&session] { return fetch(session); })();
+                })
+                .transform([](const std::string& body) { return body.size(); })
+                .value_or(0);
+```
+
+If `connect` never succeeds, `fetch` is never called and the chain ends with
+that step's `error_t`. What it does not tell you is *which* step gave up —
+`error_t` carries the count, the time waited and the last exception, not a
+name. When that matters, label each step as it fails:
+
+```cpp
+struct step_error_t {
+    std::string_view step;
+    retry::error_t error;
+};
+
+auto at = [](std::string_view step) {
+    return [step](retry::error_t error) { return step_error_t{step, std::move(error)}; };
+};
+
+auto page = crn::make_retry(quiet, resolve)()
+                .transform_error(at("resolve"))
+                .and_then([&](const endpoint_t& endpoint) {
+                    return crn::make_retry(quiet, [&endpoint] { return connect(endpoint); })()
+                        .transform_error(at("connect"));
+                });
+```
+
 By default an attempt succeeds when its result is *explicitly* convertible to
 `bool` and converts to `true` — which covers `std::optional`, smart pointers
 and `std::expected` — while plain values are always accepted: an `int` of `0`
